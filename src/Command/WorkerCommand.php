@@ -17,6 +17,13 @@ use Queue\Queue\Config;
  */
 class WorkerCommand extends Command {
 
+	/**
+	 * @return string
+	 */
+	public static function getDescription(): string {
+		return 'Manage queue workers.';
+	}
+
 	protected QueueProcessesTable $QueueProcesses;
 
 	/**
@@ -35,7 +42,7 @@ class WorkerCommand extends Command {
 	 * @inheritDoc
 	 */
 	public static function defaultName(): string {
-		return 'queue job';
+		return 'queue worker';
 	}
 
 	/**
@@ -51,6 +58,12 @@ class WorkerCommand extends Command {
 		$parser->addArgument('pid', [
 			'help' => 'PID (Process/Worker ID)',
 			'required' => false,
+		]);
+		$parser->addOption('force', [
+			'short' => 'f',
+			'help' => 'For `clean`: remove ALL queue_processes rows regardless of last heartbeat. '
+				. 'Use after container restarts when PID reuse blocks new workers from registering.',
+			'boolean' => true,
 		]);
 
 		$parser->setDescription(
@@ -73,7 +86,7 @@ class WorkerCommand extends Command {
 			$io->out('Actions are:');
 			$io->out('- end: Gracefully end a worker/process, use "all"/"server" for all');
 			$io->out('- kill: Kill a worker/process, use "all"/"server" for all');
-			$io->out('- clean: ');
+			$io->out('- clean: Remove stale processes (use --force to wipe all)');
 			$io->out();
 
 			/** @var array<\Queue\Model\Entity\QueueProcess> $processes */
@@ -105,8 +118,11 @@ class WorkerCommand extends Command {
 			$io->abort('Clean action does not have a 2nd argument.');
 		}
 
-		/** @phpstan-ignore-next-line */
-		return $this->$action($io, $pid);
+		if ($action === 'clean') {
+			return $this->clean($io, (bool)$args->getOption('force'));
+		}
+
+		return (int)$this->$action($io, $pid);
 	}
 
 	/**
@@ -119,7 +135,9 @@ class WorkerCommand extends Command {
 		if ($pid === 'all' || $pid === 'server') {
 			$workers = $this->QueueProcesses->getProcesses($pid === 'server');
 			foreach ($workers as $worker) {
-				$this->QueueProcesses->endProcess($worker->pid);
+				// By row, not PID: in containers several workers can share PID 1.
+				$worker->terminate = true;
+				$this->QueueProcesses->saveOrFail($worker);
 				$io->success('Job ' . $worker->pid . ' marked for termination (will finish current job)');
 			}
 
@@ -151,7 +169,7 @@ class WorkerCommand extends Command {
 			foreach ($workers as $worker) {
 				if ($pid === 'all' && Configure::read('Queue.multiserver')) {
 					$serverString = $this->QueueProcesses->buildServerString();
-					if ($serverString !== $worker->workerkey) {
+					if ($serverString !== $worker->server) {
 						$io->abort('Cannot kill by PID in multiserver environment for this CLI. You need to execute this on the same server.');
 					}
 				}
@@ -170,7 +188,7 @@ class WorkerCommand extends Command {
 
 		if (Configure::read('Queue.multiserver')) {
 			$serverString = $this->QueueProcesses->buildServerString();
-			if ($serverString !== $worker->workerkey) {
+			if ($serverString !== $worker->server) {
 				$io->abort('Cannot kill by PID in multiserver environment for this CLI. You need to execute this on the same server.');
 			}
 		}
@@ -184,10 +202,21 @@ class WorkerCommand extends Command {
 
 	/**
 	 * @param \Cake\Console\ConsoleIo $io
+	 * @param bool $force If true, ignores the heartbeat threshold and removes
+	 *  every queue_processes row. Recovery path for container restarts where
+	 *  recycled PIDs would otherwise collide with surviving rows.
 	 *
 	 * @return int
 	 */
-	protected function clean(ConsoleIo $io): int {
+	protected function clean(ConsoleIo $io, bool $force = false): int {
+		if ($force) {
+			$io->out('Force-deleting ALL queue_processes rows.');
+			$result = $this->QueueProcesses->cleanEndedProcesses(true);
+			$io->success('Deleted: ' . $result);
+
+			return static::CODE_SUCCESS;
+		}
+
 		$timeout = Config::defaultworkertimeout();
 		if (!$timeout) {
 			$io->abort('You disabled `defaultRequeueTimeout` in config. Aborting.');

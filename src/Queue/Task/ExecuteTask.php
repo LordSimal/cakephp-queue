@@ -49,15 +49,21 @@ class ExecuteTask extends Task implements AddInterface {
 			return;
 		}
 
-		$command = $data;
-		$params = null;
-		if (strpos($data, ' ') !== false) {
-			[$command, $params] = explode(' ', $data, 2);
-		}
+		// Tokenize like a shell so a quoted command path with embedded
+		// spaces survives intact:
+		//   bin/cake queue add Execute '"/usr/local/bin/My Tool" arg1 arg2'
+		// parses to command="/usr/local/bin/My Tool", params=["arg1","arg2"].
+		// `str_getcsv` with space-as-delimiter respects double-quoted
+		// strings and strips the surrounding quotes for us. Falls back to
+		// the simple `explode(' ', $data, 2)` shape for plain inputs.
+		$tokens = str_getcsv($data, ' ', '"', '\\');
+		$tokens = array_values(array_filter($tokens, static fn ($t) => $t !== '' && $t !== null));
+		$command = (string)array_shift($tokens);
+		$params = $tokens;
 
 		$data = [
 			'command' => $command,
-			'params' => $params ? [$params] : [],
+			'params' => $params,
 		];
 
 		$this->QueuedJobs->createJob('Queue.Execute', $data);
@@ -90,16 +96,23 @@ class ExecuteTask extends Task implements AddInterface {
 			throw new QueueException('Command escaping must be enabled when debug mode is off for security reasons');
 		}
 
-		$command = $data['command'];
-		if ($data['escape']) {
-			$command = escapeshellcmd($data['command']);
+		$rawCommand = (string)$data['command'];
+		if (!Configure::read('debug')) {
+			$allowed = (array)Configure::read('Queue.executeAllowedCommands', []);
+			if (!$allowed || !in_array($rawCommand, $allowed, true)) {
+				throw new QueueException(
+					'Command `' . $rawCommand . '` is not in Queue.executeAllowedCommands allow-list',
+				);
+			}
 		}
+
+		$command = $data['escape'] ? escapeshellarg($rawCommand) : $rawCommand;
 
 		if ($data['params']) {
 			$params = $data['params'];
 			if ($data['escape']) {
 				foreach ($params as $key => $value) {
-					$params[$key] = escapeshellcmd($value);
+					$params[$key] = escapeshellarg((string)$value);
 				}
 			}
 			$command .= ' ' . implode(' ', $params);

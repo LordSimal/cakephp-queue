@@ -3,7 +3,10 @@ declare(strict_types=1);
 
 namespace Queue\Test\TestCase\Controller\Admin;
 
+use Cake\Core\Configure;
+use Cake\Core\Plugin;
 use Cake\Datasource\ConnectionManager;
+use Cake\Http\Exception\NotFoundException;
 use Cake\Http\ServerRequest;
 use Cake\I18n\DateTime;
 use Cake\TestSuite\IntegrationTestTrait;
@@ -47,8 +50,15 @@ class QueueControllerTest extends TestCase {
 		$this->invokeMethod($controller, 'loadHelpers');
 
 		$view = $controller->createView();
-		$engine = $view->Time->getConfig('engine');
-		$this->assertTrue(in_array($engine, [DateTime::class, ToolsDateTime::class], true));
+
+		// Time helper should be loaded (either Tools.Time or core Time)
+		$this->assertTrue($view->helpers()->has('Time'));
+
+		// If Tools plugin is loaded, it should use the Tools Time helper with engine config
+		if (Plugin::isLoaded('Tools')) {
+			$engine = $view->Time->getConfig('engine');
+			$this->assertTrue(in_array($engine, [DateTime::class, ToolsDateTime::class], true));
+		}
 	}
 
 	/**
@@ -60,6 +70,133 @@ class QueueControllerTest extends TestCase {
 		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
 
 		$this->assertResponseCode(200);
+	}
+
+	/**
+	 * The pending/scheduled detail lists must be capped to
+	 * Queue.adminDetailsLimit so the dashboard renders a bounded amount of
+	 * markup and DebugKit's Variables panel doesn't OOM on large backlogs.
+	 *
+	 * @return void
+	 */
+	public function testIndexTruncatesPendingDetailsAtDetailsLimit() {
+		Configure::write('Queue.adminDetailsLimit', 3);
+
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		for ($i = 0; $i < 5; $i++) {
+			$QueuedJobs->createJob('Queue.Example', ['n' => $i]);
+		}
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$pendingDetails = $this->viewVariable('pendingDetails');
+		$this->assertCount(3, $pendingDetails);
+		$this->assertTrue($this->viewVariable('pendingDetailsTruncated'));
+		$this->assertSame(5, $this->viewVariable('totalPending'));
+		$this->assertSame(3, $this->viewVariable('detailsLimit'));
+	}
+
+	/**
+	 * @return void
+	 */
+	public function testIndexListsAbortedJobs() {
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		$QueuedJobs->createJob('Queue.Example', null, ['reference' => 'pending-one']);
+		$aborted = $QueuedJobs->createJob('Queue.Example', null, ['reference' => 'aborted-one']);
+		$QueuedJobs->markJobAborted($aborted);
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$this->assertSame(['pending-one'], array_column($this->viewVariable('pendingDetails'), 'reference'));
+		$this->assertSame(['aborted-one'], array_column($this->viewVariable('abortedDetails'), 'reference'));
+		$this->assertFalse($this->viewVariable('abortedDetailsTruncated'));
+		$this->assertSame(1, $this->viewVariable('abortedJobs'));
+		$this->assertResponseContains('status=aborted');
+	}
+
+	/**
+	 * @return void
+	 */
+	public function testIndexTruncatesAbortedDetailsAtDetailsLimit() {
+		Configure::write('Queue.adminDetailsLimit', 2);
+
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		for ($i = 0; $i < 3; $i++) {
+			$QueuedJobs->markJobAborted($QueuedJobs->createJob('Queue.Example', ['n' => $i]));
+		}
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$this->assertCount(2, $this->viewVariable('abortedDetails'));
+		$this->assertTrue($this->viewVariable('abortedDetailsTruncated'));
+		$this->assertSame(3, $this->viewVariable('abortedJobs'));
+	}
+
+	/**
+	 * A details limit of 0 lists no rows, but the card and its link must stay.
+	 *
+	 * @return void
+	 */
+	public function testIndexShowsAbortedCardWithZeroDetailsLimit() {
+		Configure::write('Queue.adminDetailsLimit', 0);
+
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		$QueuedJobs->markJobAborted($QueuedJobs->createJob('Queue.Example'));
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$this->assertSame([], $this->viewVariable('abortedDetails'));
+		$this->assertSame(1, $this->viewVariable('abortedJobs'));
+		$this->assertResponseContains('status=aborted');
+	}
+
+	/**
+	 * @return void
+	 */
+	public function testResetAborted() {
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		$QueuedJobs->markJobAborted($QueuedJobs->createJob('Queue.Example'));
+
+		$this->post(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'reset', '?' => ['aborted' => 1]]);
+
+		$this->assertResponseCode(302);
+		$this->assertSame(0, $QueuedJobs->getAbortedCount());
+	}
+
+	/**
+	 * @return void
+	 */
+	public function testIndexHidesAbortedCardWithoutAbortedJobs() {
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$this->assertSame([], $this->viewVariable('abortedDetails'));
+		$this->assertResponseNotContains('status=aborted');
+	}
+
+	/**
+	 * The truncation flag must stay false when the backlog fits inside the
+	 * cap — otherwise the "Showing N of M" hint would render unnecessarily
+	 * and the controller would issue an extra count() it doesn't need.
+	 *
+	 * @return void
+	 */
+	public function testIndexNotTruncatedWhenWithinLimit() {
+		Configure::write('Queue.adminDetailsLimit', 200);
+
+		$QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+		$QueuedJobs->createJob('Queue.Example');
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+		$this->assertFalse($this->viewVariable('pendingDetailsTruncated'));
+		$this->assertFalse($this->viewVariable('scheduledDetailsTruncated'));
+		$this->assertSame(1, $this->viewVariable('totalPending'));
 	}
 
 	/**
@@ -92,6 +229,30 @@ class QueueControllerTest extends TestCase {
 	}
 
 	/**
+	 * posix_kill() treats -1 as "every process"; only known workers may be signaled.
+	 *
+	 * @return void
+	 */
+	public function testProcessesKillRejectsUnknownPid() {
+		$this->expectException(NotFoundException::class);
+
+		$this->post(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'processes', '?' => ['kill' => '-1']]);
+	}
+
+	/**
+	 * @return void
+	 */
+	public function testResetJobRedirectRejectsBackslashHost() {
+		$jobsTable = $this->getTableLocator()->get('Queue.QueuedJobs');
+		$job = $jobsTable->newEntity(['job_task' => 'foo', 'attempts' => 1, 'failure_message' => 'Some error']);
+		$jobsTable->saveOrFail($job);
+
+		$this->post(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'resetJob', $job->id, '?' => ['redirect' => '/\\evil.example']]);
+
+		$this->assertRedirect(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+	}
+
+	/**
 	 * @return void
 	 */
 	public function testAddJob() {
@@ -114,6 +275,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -133,6 +295,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -153,6 +316,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -175,6 +339,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -197,6 +362,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -223,6 +389,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 		]);
 		$jobsTable->saveOrFail($job);
 
@@ -243,6 +410,7 @@ class QueueControllerTest extends TestCase {
 		$job = $jobsTable->newEntity([
 			'job_task' => 'foo',
 			'attempts' => 1,
+			'failure_message' => 'Some error',
 			'fetched' => (new DateTime())->subHours(1),
 		]);
 		$jobsTable->saveOrFail($job);
@@ -277,13 +445,24 @@ class QueueControllerTest extends TestCase {
 	}
 
 	/**
+	 * @return void
+	 */
+	public function testIndexStandalone(): void {
+		Configure::write('Queue.standalone', true);
+
+		$this->get(['prefix' => 'Admin', 'plugin' => 'Queue', 'controller' => 'Queue', 'action' => 'index']);
+
+		$this->assertResponseCode(200);
+	}
+
+	/**
 	 * Helper method for skipping tests that need a real connection.
 	 *
 	 * @return void
 	 */
 	protected function _needsConnection() {
 		$config = ConnectionManager::getConfig('test');
-		$skip = strpos($config['driver'], 'Mysql') === false && strpos($config['driver'], 'Postgres') === false;
+		$skip = !str_contains((string)$config['driver'], 'Mysql') && !str_contains((string)$config['driver'], 'Postgres');
 		$this->skipIf($skip, 'Only Mysql/Postgres is working yet for this.');
 	}
 

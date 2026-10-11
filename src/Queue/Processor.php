@@ -6,6 +6,7 @@ namespace Queue\Queue;
 use Cake\Console\CommandInterface;
 use Cake\Core\Configure;
 use Cake\Core\ContainerInterface;
+use Cake\Datasource\ConnectionManager;
 use Cake\Datasource\Exception\RecordNotFoundException;
 use Cake\Event\Event;
 use Cake\Event\EventManager;
@@ -21,8 +22,13 @@ use Queue\Model\Table\QueuedJobsTable;
 use Queue\Model\Table\QueueProcessesTable;
 use RuntimeException;
 use Throwable;
+use const SIGINT;
+use const SIGQUIT;
+use const SIGTERM;
+use const SIGTSTP;
+use const SIGUSR1;
 
-declare(ticks=1);
+// Enable async signal handling (replaces declare(ticks=1) for better performance)
 
 /**
  * Main shell to init and run queue workers.
@@ -67,6 +73,14 @@ class Processor {
 	protected ?string $pid = null;
 
 	/**
+	 * Random per-process identifier. Stable across the worker's lifetime;
+	 * unlike `pid`, never reused. Used for heartbeat and shutdown lookups.
+	 *
+	 * @var string|null
+	 */
+	protected ?string $workerkey = null;
+
+	/**
 	 * @var \Queue\Model\Table\QueuedJobsTable
 	 */
 	protected QueuedJobsTable $QueuedJobs;
@@ -82,18 +96,69 @@ class Processor {
 	protected ?QueuedJob $currentJob = null;
 
 	/**
+	 * @var bool|null
+	 */
+	protected ?bool $captureOutput = null;
+
+	/**
+	 * @var string
+	 */
+	protected string $connection = 'default';
+
+	/**
 	 * @param \Queue\Console\Io $io
 	 * @param \Psr\Log\LoggerInterface $logger
 	 * @param \Cake\Core\ContainerInterface|null $container
+	 * @param string|null $connection Database connection to use
 	 */
-	public function __construct(Io $io, LoggerInterface $logger, ?ContainerInterface $container = null) {
+	public function __construct(Io $io, LoggerInterface $logger, ?ContainerInterface $container = null, ?string $connection = null) {
 		$this->io = $io;
 		$this->logger = $logger;
 		$this->container = $container;
+		$this->connection = $this->resolveConnection($connection);
 
 		$tableLocator = $this->getTableLocator();
 		$this->QueuedJobs = $tableLocator->get('Queue.QueuedJobs');
 		$this->QueueProcesses = $tableLocator->get('Queue.QueueProcesses');
+
+		// Set connection for multi-connection support
+		if ($this->connection !== 'default') {
+			/** @var \Cake\Database\Connection $connectionObject */
+			$connectionObject = ConnectionManager::get($this->connection);
+			$this->QueuedJobs->setConnection($connectionObject);
+			$this->QueueProcesses->setConnection($connectionObject);
+		}
+	}
+
+	/**
+	 * Resolve and validate the connection name.
+	 *
+	 * @param string|null $connection Requested connection
+	 *
+	 * @throws \RuntimeException If connection is not in whitelist
+	 *
+	 * @return string
+	 */
+	protected function resolveConnection(?string $connection): string {
+		$connections = Configure::read('Queue.connections');
+
+		// Single connection mode (backwards compatible)
+		if (!$connections || !is_array($connections) || count($connections) < 2) {
+			return $connection ?: 'default';
+		}
+
+		// Multi-connection mode
+		if ($connection === null) {
+			// Use first connection as default
+			return $connections[0];
+		}
+
+		// Validate against whitelist
+		if (!in_array($connection, $connections, true)) {
+			throw new RuntimeException(__d('queue', 'Invalid connection: {0}. Must be one of: {1}', $connection, implode(', ', $connections)));
+		}
+
+		return $connection;
 	}
 
 	/**
@@ -104,6 +169,16 @@ class Processor {
 	public function run(array $args): int {
 		$config = $this->getConfig($args);
 
+		// Sweep stale `queue_processes` rows from prior workers that died
+		// without a graceful shutdown (SIGKILL, OOM, container restart,
+		// etc.). Without this, ghost rows accumulate, count toward the
+		// `Queue.maxworkers` limit and can lock out new workers.
+		// Stale = not updated for `Queue.defaultRequeueTimeout` seconds.
+		$this->QueueProcesses->cleanEndedProcesses();
+
+		$jitterOffset = $this->computeLifetimeJitterOffset();
+		$maxRuntime = $this->resolveMaxRuntime($config['maxruntime'], $jitterOffset);
+
 		try {
 			$pid = $this->initPid();
 		} catch (PersistenceFailedException $exception) {
@@ -113,20 +188,23 @@ class Processor {
 				$this->io->out('Cannot start worker: Too many workers already/still running on this server (' . $limit . '/' . $limit . ')');
 			}
 
-			$this->QueueProcesses->cleanEndedProcesses();
+			// No retry-sweep here: the pre-sweep above already ran. If
+			// initPid still fails, the limit is genuinely reached and
+			// re-sweeping would not change that.
 
 			return CommandInterface::CODE_ERROR;
 		}
 
-		// Enable Garbage Collector (PHP >= 5.3)
-		if (function_exists('gc_enable')) {
-			gc_enable();
+		gc_enable();
+
+		if (function_exists('pcntl_async_signals')) {
+			pcntl_async_signals(true);
 		}
 		if (function_exists('pcntl_signal')) {
-			pcntl_signal(SIGTERM, [&$this, 'exit']);
-			pcntl_signal(SIGINT, [&$this, 'abort']);
-			pcntl_signal(SIGTSTP, [&$this, 'abort']);
-			pcntl_signal(SIGQUIT, [&$this, 'abort']);
+			pcntl_signal(SIGTERM, $this->exit(...));
+			pcntl_signal(SIGINT, $this->abort(...));
+			pcntl_signal(SIGTSTP, $this->abort(...));
+			pcntl_signal(SIGQUIT, $this->abort(...));
 			if (Configure::read('Queue.canInterruptSleep')) {
 				// Defining a signal handler here will make the worker wake up
 				// from its sleep() when SIGUSR1 is received. Since waking it
@@ -145,12 +223,12 @@ class Processor {
 
 			try {
 				$this->updatePid($pid);
-			} catch (RecordNotFoundException $exception) {
+			} catch (RecordNotFoundException) {
 				// Manually killed
 				$this->exit = true;
 
 				continue;
-			} catch (ProcessEndingException $exception) {
+			} catch (ProcessEndingException) {
 				// Soft killed, e.g. during deploy update
 				$this->exit = true;
 
@@ -159,8 +237,8 @@ class Processor {
 
 			if ($config['verbose']) {
 				$this->log('run', $pid, false);
+				$this->io->out('[' . date('Y-m-d H:i:s') . '] Looking for Job ...');
 			}
-			$this->io->out('[' . date('Y-m-d H:i:s') . '] Looking for Job ...');
 
 			$queuedJob = $this->QueuedJobs->requestJob($this->getTaskConf(), $config['groups'], $config['types']);
 
@@ -170,15 +248,12 @@ class Processor {
 				$this->io->out('nothing to do, exiting.');
 				$this->exit = true;
 			} else {
-				$this->io->out('nothing to do, sleeping.');
+				if ($config['verbose']) {
+					$this->io->out('nothing to do, sleeping.');
+				}
 				sleep(Config::sleeptime());
 			}
 
-			$workerLifetime = Configure::read('Queue.workerLifetime') ?? Configure::read('Queue.workermaxruntime');
-			if ($workerLifetime === null && $config['maxruntime'] === null) {
-				throw new RuntimeException('Queue.workerLifetime (or deprecated workermaxruntime) config is required');
-			}
-			$maxRuntime = $config['maxruntime'] ?? (int)$workerLifetime;
 			// check if we are over the maximum runtime and end processing if so.
 			if ($maxRuntime > 0 && (time() - $startTime) >= $maxRuntime) {
 				$this->exit = true;
@@ -187,9 +262,15 @@ class Processor {
 			if ($this->exit || mt_rand(0, 100) > 100 - (int)Config::gcprob()) {
 				$this->io->out('Performing Old job cleanup.');
 				$this->QueuedJobs->cleanOldJobs();
-				$this->QueueProcesses->cleanEndedProcesses();
+				$this->QueuedJobs->abortStaleJobs($this->getTaskConf());
+				// `cleanEndedProcesses()` is no longer called here: it now
+				// runs unconditionally at every worker startup, so the
+				// shutdown sweep is redundant. `cleanOldJobs()` stays —
+				// that's about the queued_jobs table, not workers.
 			}
-			$this->io->hr();
+			if ($config['verbose']) {
+				$this->io->hr();
+			}
 		}
 
 		$this->deletePid($pid);
@@ -212,6 +293,18 @@ class Processor {
 		$this->io->out('Running Job of type "' . $queuedJob->job_task . '"');
 		$this->log('job ' . $queuedJob->job_task . ', id ' . $queuedJob->id, $pid, false);
 		$taskName = $queuedJob->job_task;
+
+		// Dispatch started event
+		$event = new Event('Queue.Job.started', $this, [
+			'job' => $queuedJob,
+		]);
+		EventManager::instance()->dispatch($event);
+
+		$captureOutput = $this->captureOutput();
+		if ($captureOutput) {
+			$maxOutputSize = (int)(Configure::read('Queue.maxOutputSize') ?: 65536);
+			$this->io->enableOutputCapture($maxOutputSize);
+		}
 
 		$return = $failureMessage = null;
 		try {
@@ -236,14 +329,35 @@ class Processor {
 			$this->logError($taskName . ' (job ' . $queuedJob->id . ')' . "\n" . $failureMessage, $pid);
 		}
 
+		$capturedOutput = null;
+		if ($captureOutput) {
+			$maxOutputSize = (int)(Configure::read('Queue.maxOutputSize') ?: 65536);
+			$capturedOutput = $this->io->getOutputAsText($maxOutputSize);
+			$this->io->disableOutputCapture();
+		}
+
 		if ($return === false) {
-			$this->QueuedJobs->markJobFailed($queuedJob, $failureMessage);
+			$this->QueuedJobs->markJobFailed($queuedJob, $failureMessage, $capturedOutput);
 			$failedStatus = $this->QueuedJobs->getFailedStatus($queuedJob, $this->getTaskConf());
 			$this->log('job ' . $queuedJob->job_task . ', id ' . $queuedJob->id . ' failed and ' . $failedStatus, $pid);
 			$this->io->out('Job did not finish, ' . $failedStatus . ' after try ' . $queuedJob->attempts . '.');
 
+			// Dispatch failed event
+			$event = new Event('Queue.Job.failed', $this, [
+				'job' => $queuedJob,
+				'failureMessage' => $failureMessage,
+				'exception' => $e,
+			]);
+			EventManager::instance()->dispatch($event);
+
 			// Dispatch event when job has exhausted all retries
-			if ($failedStatus === 'aborted') {
+			if ($failedStatus === $this->QueuedJobs::STATUS_ABORTED) {
+				// Persist the terminal state so the job stops counting as
+				// queued/in-progress (it will never run again). Without this
+				// it keeps `completed IS NULL` forever and wedges callers that
+				// gate on isQueued(), e.g. a non-concurrent scheduler row.
+				$this->QueuedJobs->markJobAborted($queuedJob);
+
 				$event = new Event('Queue.Job.maxAttemptsExhausted', $this, [
 					'job' => $queuedJob,
 					'failureMessage' => $failureMessage,
@@ -251,10 +365,19 @@ class Processor {
 				EventManager::instance()->dispatch($event);
 			}
 
+			$this->currentJob = null;
+
 			return;
 		}
 
-		$this->QueuedJobs->markJobDone($queuedJob);
+		$this->QueuedJobs->markJobDone($queuedJob, $capturedOutput);
+
+		// Dispatch completed event
+		$event = new Event('Queue.Job.completed', $this, [
+			'job' => $queuedJob,
+		]);
+		EventManager::instance()->dispatch($event);
+
 		$this->io->out('Job Finished.');
 		$this->currentJob = null;
 	}
@@ -322,6 +445,39 @@ class Processor {
 	}
 
 	/**
+	 * Whether to capture task output into the DB.
+	 *
+	 * Auto-detects based on `output` column existence if not explicitly configured.
+	 *
+	 * @return bool
+	 */
+	protected function captureOutput(): bool {
+		$configured = Configure::read('Queue.captureOutput');
+		if ($configured !== null) {
+			// Explicit config never changes mid-process, so memoize that
+			// branch and short-circuit on subsequent calls.
+			if ($this->captureOutput === null) {
+				$this->captureOutput = (bool)$configured;
+			}
+
+			return $this->captureOutput;
+		}
+
+		// Auto-detection path: re-check on every call rather than caching
+		// for the lifetime of the worker. A long-running worker that was
+		// started before `bin/cake migrations migrate` added the `output`
+		// column would otherwise see the old `false` for the rest of its
+		// runtime and silently drop captured stdout until restart. The
+		// per-call cost is a single schema lookup against a cached
+		// description, which is negligible compared to running a job.
+		try {
+			return $this->QueuedJobs->getSchema()->hasColumn('output');
+		} catch (Throwable) {
+			return false;
+		}
+	}
+
+	/**
 	 * Signal handling to queue worker for clean shutdown
 	 *
 	 * @param int $signal
@@ -329,13 +485,32 @@ class Processor {
 	 * @return void
 	 */
 	protected function exit(int $signal): void {
-		if ($this->currentJob) {
+		$job = $this->currentJob;
+		if ($job) {
 			$failureMessage = 'Worker process terminated by signal (SIGTERM) - job execution interrupted due to timeout or manual termination';
-			$this->QueuedJobs->markJobFailed($this->currentJob, $failureMessage);
-			$this->logError('Job ' . $this->currentJob->job_task . ' (id ' . $this->currentJob->id . ') failed due to worker termination', $this->pid);
-			$this->io->out('Current job marked as failed due to worker termination.');
+			$capturedOutput = null;
+			if ($this->captureOutput()) {
+				$maxOutputSize = (int)(Configure::read('Queue.maxOutputSize') ?: 65536);
+				$capturedOutput = $this->io->getOutputAsText($maxOutputSize);
+				$this->io->disableOutputCapture();
+			}
+			$this->QueuedJobs->markJobFailed($job, $failureMessage, $capturedOutput);
+			$this->markAbortedIfExhausted($job);
+			$this->logError('Job ' . $job->job_task . ' (id ' . $job->id . ') failed due to worker termination', $this->pid);
+			$this->currentJob = null;
 		}
 		$this->exit = true;
+	}
+
+	/**
+	 * @param \Queue\Model\Entity\QueuedJob $queuedJob
+	 *
+	 * @return void
+	 */
+	protected function markAbortedIfExhausted(QueuedJob $queuedJob): void {
+		if ($this->QueuedJobs->getFailedStatus($queuedJob, $this->getTaskConf()) === QueuedJobsTable::STATUS_ABORTED) {
+			$this->QueuedJobs->markJobAborted($queuedJob);
+		}
 	}
 
 	/**
@@ -346,6 +521,19 @@ class Processor {
 	 * @return void
 	 */
 	protected function abort(int $signal = 1): void {
+		if ($this->currentJob) {
+			$failureMessage = 'Worker process aborted by signal (' . $signal . ') - job execution interrupted';
+			$capturedOutput = null;
+			if ($this->captureOutput()) {
+				$maxOutputSize = (int)(Configure::read('Queue.maxOutputSize') ?: 65536);
+				$capturedOutput = $this->io->getOutputAsText($maxOutputSize);
+				$this->io->disableOutputCapture();
+			}
+			$this->QueuedJobs->markJobFailed($this->currentJob, $failureMessage, $capturedOutput);
+			$this->markAbortedIfExhausted($this->currentJob);
+			$this->currentJob = null;
+		}
+
 		$this->deletePid($this->pid);
 
 		exit($signal);
@@ -360,6 +548,7 @@ class Processor {
 		$this->QueueProcesses->add($pid, $key);
 
 		$this->pid = $pid;
+		$this->workerkey = $key;
 
 		return $pid;
 	}
@@ -368,22 +557,20 @@ class Processor {
 	 * @return string
 	 */
 	protected function retrievePid(): string {
-		if (function_exists('posix_getpid')) {
-			$pid = (string)posix_getpid();
-		} else {
-			$pid = $this->QueuedJobs->key();
-		}
-
-		return $pid;
+		return function_exists('posix_getpid') ? (string)posix_getpid() : $this->QueuedJobs->key();
 	}
 
 	/**
-	 * @param string $pid
+	 * @param string $pid Kept for log context; the actual lookup uses
+	 *  the per-process workerkey since PIDs are not unique identities.
 	 *
 	 * @return void
 	 */
 	protected function updatePid(string $pid): void {
-		$this->QueueProcesses->update($pid);
+		if ($this->workerkey === null) {
+			return;
+		}
+		$this->QueueProcesses->update($this->workerkey);
 	}
 
 	/**
@@ -401,19 +588,18 @@ class Processor {
 	}
 
 	/**
-	 * @param string|null $pid
+	 * @param string|null $pid Kept for backwards-compatible signature; the
+	 *  actual lookup uses the per-process workerkey since PIDs are not
+	 *  unique identities.
 	 *
 	 * @return void
 	 */
 	protected function deletePid(?string $pid): void {
-		if (!$pid) {
-			$pid = $this->pid;
-		}
-		if (!$pid) {
+		if ($this->workerkey === null) {
 			return;
 		}
 
-		$this->QueueProcesses->remove($pid);
+		$this->QueueProcesses->remove($this->workerkey);
 	}
 
 	/**
@@ -490,6 +676,50 @@ class Processor {
 		}
 
 		set_time_limit($timeLimit);
+	}
+
+	/**
+	 * Compute the per-worker lifetime jitter offset in seconds.
+	 *
+	 * Returns a random integer in [0, Queue.workerLifetimeJitter]. Used to stagger
+	 * worker shutdowns so a fleet spawned at the same moment does not all exit
+	 * on the same tick (thundering herd).
+	 *
+	 * @return int
+	 */
+	protected function computeLifetimeJitterOffset(): int {
+		$jitter = (int)Configure::read('Queue.workerLifetimeJitter', 0);
+		if ($jitter <= 0) {
+			return 0;
+		}
+
+		return mt_rand(0, $jitter);
+	}
+
+	/**
+	 * Resolve the effective worker runtime, applying jitter only to bounded workers.
+	 *
+	 * @param int|null $maxruntime Max runtime in seconds if set via CLI option.
+	 * @param int $jitterOffset Per-worker random offset in seconds.
+	 *
+	 * @throws \RuntimeException
+	 *
+	 * @return int
+	 */
+	protected function resolveMaxRuntime(?int $maxruntime, int $jitterOffset): int {
+		$workerLifetime = Configure::read('Queue.workerLifetime') ?? Configure::read('Queue.workermaxruntime');
+		if ($workerLifetime === null && $maxruntime === null) {
+			throw new RuntimeException('Queue.workerLifetime (or deprecated workermaxruntime) config is required');
+		}
+
+		$resolvedMaxRuntime = $maxruntime ?? (int)$workerLifetime;
+		if ($resolvedMaxRuntime <= 0 || $jitterOffset <= 0) {
+			return (int)$resolvedMaxRuntime;
+		}
+
+		$this->io->out('Applying worker lifetime jitter: +' . $jitterOffset . ' seconds');
+
+		return (int)$resolvedMaxRuntime + $jitterOffset;
 	}
 
 	/**

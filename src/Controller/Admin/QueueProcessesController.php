@@ -3,18 +3,22 @@ declare(strict_types=1);
 
 namespace Queue\Controller\Admin;
 
-use App\Controller\AppController;
 use Cake\Core\Configure;
+use Cake\Http\Exception\BadRequestException;
 use Exception;
+use const SIGTERM;
 
 /**
  * @property \Queue\Model\Table\QueueProcessesTable $QueueProcesses
- * @method \Cake\Datasource\ResultSetInterface<\Queue\Model\Entity\QueueProcess> paginate(\Cake\Datasource\RepositoryInterface|\Cake\Datasource\QueryInterface|string|null $object = null, array $settings = [])
  * @property \Queue\Model\Table\QueuedJobsTable $QueuedJobs
+ * @method \Cake\Datasource\ResultSetInterface<\Queue\Model\Entity\QueueProcess> paginate(\Cake\Datasource\RepositoryInterface|\Cake\Datasource\QueryInterface|string|null $object = null, array $settings = [])
  */
-class QueueProcessesController extends AppController {
+class QueueProcessesController extends QueueAppController {
 
-	use LoadHelperTrait;
+	/**
+	 * @var string|null
+	 */
+	protected ?string $defaultTable = 'Queue.QueueProcesses';
 
 	/**
 	 * @var array<string, mixed>
@@ -31,7 +35,10 @@ class QueueProcessesController extends AppController {
 	public function initialize(): void {
 		parent::initialize();
 
-		$this->loadHelpers();
+		// Set connection for multi-connection support
+		if ($this->activeConnection !== $this->QueueProcesses->getConnection()->configName()) {
+			$this->QueueProcesses->setConnection($this->getActiveConnectionObject());
+		}
 	}
 
 	/**
@@ -94,7 +101,7 @@ class QueueProcessesController extends AppController {
 			$queueProcess->terminate = true;
 			$this->QueueProcesses->saveOrFail($queueProcess);
 			$this->Flash->success(__d('queue', 'The queue process has been deleted.'));
-		} catch (Exception $exception) {
+		} catch (Exception) {
 			$this->Flash->error(__d('queue', 'The queue process could not be deleted. Please, try again.'));
 		}
 
@@ -111,6 +118,10 @@ class QueueProcessesController extends AppController {
 		$this->request->allowMethod(['post', 'delete']);
 		$queueProcess = $this->QueueProcesses->get($id);
 
+		// SIGINT, SIGKILL, SIGTERM as numbers: the constants are missing without pcntl.
+		if (!in_array($sig, [null, 0, 2, 9, 15], true)) {
+			throw new BadRequestException('Unsupported signal.');
+		}
 		if (!Configure::read('Queue.multiserver')) {
 			$this->QueueProcesses->terminateProcess($queueProcess->pid, $sig ?: SIGTERM);
 		}

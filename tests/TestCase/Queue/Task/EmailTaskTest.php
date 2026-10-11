@@ -209,6 +209,118 @@ class EmailTaskTest extends TestCase {
 	}
 
 	/**
+	 * Address settings stored as associative `email => name` maps must be
+	 * accepted without triggering PHP 8 "Unknown named parameter" errors.
+	 *
+	 * @return void
+	 */
+	public function testRunArrayAssociativeAddressMap() {
+		$settings = [
+			'from' => [
+				'sender@test.de' => 'Sender Name',
+			],
+			'to' => [
+				'recipient@test.de' => 'Recipient Name',
+			],
+			'cc' => [
+				'copy@test.de' => 'Copy Name',
+				'copy-other@test.de' => 'Other Copy Name',
+			],
+			'bcc' => [
+				'bcc@test.de' => 'BCC Name',
+			],
+			'replyTo' => [
+				'reply@test.de' => 'Reply Name',
+			],
+		];
+
+		$data = [
+			'settings' => $settings,
+			'content' => 'Foo Bar',
+		];
+		$this->Task->run($data, 0);
+
+		$this->assertInstanceOf(Mailer::class, $this->Task->mailer);
+
+		$mailer = $this->Task->mailer;
+		$this->assertSame(['sender@test.de' => 'Sender Name'], $mailer->getFrom());
+		$this->assertSame(['recipient@test.de' => 'Recipient Name'], $mailer->getTo());
+		$this->assertSame([
+			'copy@test.de' => 'Copy Name',
+			'copy-other@test.de' => 'Other Copy Name',
+		], $mailer->getCc());
+		$this->assertSame(['bcc@test.de' => 'BCC Name'], $mailer->getBcc());
+		$this->assertSame(['reply@test.de' => 'Reply Name'], $mailer->getReplyTo());
+	}
+
+	/**
+	 * Settings keys coming from a JSON-round-tripped `Message::__serialize()` payload
+	 * (e.g. `htmlMessage`, `textMessage`, `appCharset`) must not be routed to
+	 * nonexistent `set<Prop>()` methods on the Mailer.
+	 *
+	 * @return void
+	 */
+	public function testRunArrayMessageSerializableProperties() {
+		$settings = [
+			'from' => 'sender@test.de',
+			'to' => 'recipient@test.de',
+			'subject' => 'Message Subject',
+			'domain' => 'example.com',
+			'charset' => 'utf-8',
+			'headerCharset' => 'utf-8',
+			'appCharset' => 'UTF-8',
+			'emailFormat' => 'html',
+			'messageId' => true,
+			'htmlMessage' => '<p>Hello</p>',
+			'textMessage' => 'Hello',
+		];
+
+		$data = [
+			'settings' => $settings,
+		];
+		$this->Task->run($data, 0);
+
+		$this->assertInstanceOf(Mailer::class, $this->Task->mailer);
+
+		$message = $this->Task->mailer->getMessage();
+		$this->assertSame('Message Subject', $message->getSubject());
+		$this->assertSame('example.com', $message->getDomain());
+		$this->assertSame('html', $message->getEmailFormat());
+		$this->assertSame('utf-8', $message->getCharset());
+		$this->assertSame('utf-8', $message->getHeaderCharset());
+		$this->assertSame('<p>Hello</p>', $message->getBodyHtml());
+	}
+
+	/**
+	 * An associative `headers` map inside `settings` must not be expanded into named
+	 * parameters when calling `Message::setHeaders()`.
+	 *
+	 * @return void
+	 */
+	public function testRunArrayHeadersInSettings() {
+		$settings = [
+			'from' => 'sender@test.de',
+			'to' => 'recipient@test.de',
+			'headers' => [
+				'X-Custom' => 'queued',
+				'X-Other' => 'value',
+			],
+		];
+
+		$data = [
+			'settings' => $settings,
+			'content' => 'Foo Bar',
+		];
+		$this->Task->run($data, 0);
+
+		$this->assertInstanceOf(Mailer::class, $this->Task->mailer);
+
+		$headers = $this->Task->mailer->getMessage()->getHeaders(['_headers']);
+		$this->assertSame('queued', $headers['X-Custom']);
+		$this->assertSame('value', $headers['X-Other']);
+	}
+
+	/**
 	 * @return void
 	 */
 	public function testRunToolsEmailMessageClassString() {
@@ -304,7 +416,7 @@ class EmailTaskTest extends TestCase {
 	 */
 	protected function _skipPostgres() {
 		$config = ConnectionManager::getConfig('test');
-		$skip = strpos($config['driver'], 'Postgres') !== false;
+		$skip = str_contains((string)$config['driver'], 'Postgres');
 		$this->skipIf($skip, 'Only non Postgres is working yet for this.');
 	}
 

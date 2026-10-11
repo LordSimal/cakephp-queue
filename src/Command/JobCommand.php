@@ -8,15 +8,25 @@ use Cake\Console\Arguments;
 use Cake\Console\ConsoleIo;
 use Cake\Console\ConsoleOptionParser;
 use Cake\Core\Configure;
+use Cake\Datasource\ConnectionManager;
 use Cake\Error\Debugger;
 use Cake\I18n\DateTime;
 use Queue\Model\Entity\QueuedJob;
 use Queue\Model\Table\QueuedJobsTable;
+use Queue\Queue\Config;
+use RuntimeException;
 
 /**
  * @property \Queue\Model\Table\QueuedJobsTable $QueuedJobs
  */
 class JobCommand extends Command {
+
+	/**
+	 * @return string
+	 */
+	public static function getDescription(): string {
+		return 'Manage queued jobs.';
+	}
 
 	protected QueuedJobsTable $QueuedJobs;
 
@@ -26,11 +36,9 @@ class JobCommand extends Command {
 	protected ?string $defaultTable = 'Queue.QueuedJobs';
 
 	/**
-	 * @return void
+	 * @var string
 	 */
-	public function initialize(): void {
-		$this->QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
-	}
+	protected string $connection = 'default';
 
 	/**
 	 * @inheritDoc
@@ -53,6 +61,14 @@ class JobCommand extends Command {
 			'help' => 'ID of job record, or "all" for all',
 			'required' => false,
 		]);
+		$parser->addOption('aborted', [
+			'help' => 'With flush: remove aborted jobs (retries exhausted) instead of failed ones',
+			'boolean' => true,
+		]);
+		$parser->addOption('connection', [
+			'help' => 'Database connection to use (must be in Queue.connections whitelist if multi-connection mode is enabled)',
+			'default' => null,
+		]);
 
 		$parser->setDescription(
 			'Display, rerun, reset or remove pending jobs.',
@@ -68,6 +84,20 @@ class JobCommand extends Command {
 	 * @return int|null|void
 	 */
 	public function execute(Arguments $args, ConsoleIo $io) {
+		$connection = $args->getOption('connection');
+		if (!is_string($connection)) {
+			$connection = null;
+		}
+		$this->connection = $this->resolveConnection($connection);
+		$this->QueuedJobs = $this->fetchTable('Queue.QueuedJobs');
+
+		// Set connection for multi-connection support
+		if ($this->connection !== 'default') {
+			/** @var \Cake\Database\Connection $connectionObject */
+			$connectionObject = ConnectionManager::get($this->connection);
+			$this->QueuedJobs->setConnection($connectionObject);
+		}
+
 		$action = $args->getArgument('action');
 		if (!$action) {
 			$io->out('Please use with [action] [ID] added.');
@@ -75,7 +105,7 @@ class JobCommand extends Command {
 			$io->out('- view: Display status of a job');
 			$io->out('- rerun: Rerun a successfully run job ("all" for all)');
 			$io->out('- reset: Reset a failed job ("all" for all)');
-			$io->out('- flush: Remove (all) failed jobs');
+			$io->out('- flush: Remove (all) failed jobs, or aborted ones with --aborted');
 			$io->out('- remove: Remove a job ("all" for truncating)');
 			$io->out('- clean: Cleanup (old jobs removal)');
 			$io->out();
@@ -119,6 +149,9 @@ class JobCommand extends Command {
 
 			return $this->$action($io);
 		}
+		if ($action === 'flush' && $args->getOption('aborted')) {
+			return $this->flushAborted($io);
+		}
 		if (in_array($action, ['clean', 'flush'], true)) {
 			return $this->$action($io);
 		}
@@ -134,18 +167,26 @@ class JobCommand extends Command {
 	 * @return int
 	 */
 	protected function rerunAll(ConsoleIo $io): int {
-		/** @var array<\Queue\Model\Entity\QueuedJob> $queuedJobs */
-		$queuedJobs = $this->QueuedJobs->find()
-			->where(['completed IS NOT' => null])
-			->all()
-			->toArray();
+		$fields = [
+			'completed' => null,
+			'fetched' => null,
+			'progress' => null,
+			'attempts' => 0,
+			'workerkey' => null,
+			'failure_message' => null,
+			'output' => null,
+			'memory' => null,
+		];
+		$count = $this->QueuedJobs->updateAll($fields, ['completed IS NOT' => null]);
+		if (!$count) {
+			$io->out('No completed jobs to rerun.');
 
-		$status = static::CODE_SUCCESS;
-		foreach ($queuedJobs as $queuedJob) {
-			$status |= $this->rerun($io, $queuedJob);
+			return static::CODE_SUCCESS;
 		}
 
-		return $status;
+		$io->success($count . ' job(s) queued for rerun');
+
+		return static::CODE_SUCCESS;
 	}
 
 	/**
@@ -154,18 +195,16 @@ class JobCommand extends Command {
 	 * @return int
 	 */
 	protected function resetAll(ConsoleIo $io): int {
-		/** @var array<\Queue\Model\Entity\QueuedJob> $queuedJobs */
-		$queuedJobs = $this->QueuedJobs->find()
-			->where(['completed IS' => null])
-			->all()
-			->toArray();
+		$count = $this->QueuedJobs->reset();
+		if (!$count) {
+			$io->out('No failed jobs to reset.');
 
-		$status = static::CODE_SUCCESS;
-		foreach ($queuedJobs as $queuedJob) {
-			$status |= $this->reset($io, $queuedJob);
+			return static::CODE_SUCCESS;
 		}
 
-		return $status;
+		$io->success($count . ' job(s) reset for rerun');
+
+		return static::CODE_SUCCESS;
 	}
 
 	/**
@@ -259,6 +298,10 @@ class JobCommand extends Command {
 		if ($queuedJob->attempts) {
 			$io->out('Failure message: ' . ($queuedJob->failure_message ?: '-'));
 		}
+		if ($queuedJob->output) {
+			$io->out('Output:');
+			$io->out($queuedJob->output);
+		}
 
 		$data = $queuedJob->data;
 		$io->out('Data: ' . Debugger::exportVar($data, 9));
@@ -283,18 +326,62 @@ class JobCommand extends Command {
 	 *
 	 * @return int
 	 */
+	protected function flushAborted(ConsoleIo $io): int {
+		$result = $this->QueuedJobs->flushAbortedJobs();
+		$io->success('Deleted aborted: ' . $result);
+
+		return static::CODE_SUCCESS;
+	}
+
+	/**
+	 * @param \Cake\Console\ConsoleIo $io
+	 *
+	 * @return int
+	 */
 	protected function clean(ConsoleIo $io): int {
-		if (!Configure::read('Queue.cleanuptimeout')) {
-			$io->abort('You disabled cleanuptimout in config. Aborting.');
+		if (!Config::cleanuptimeout() && !Config::cleanupAbortedTimeout()) {
+			$io->abort('You disabled cleanuptimeout in config. Aborting.');
 		}
 
-		$date = (new DateTime())->subSeconds((int)Configure::read('Queue.cleanuptimeout'));
-
-		$io->out('Deleting old jobs, that have finished before ' . $date);
+		if (Config::cleanuptimeout()) {
+			$io->out('Deleting old jobs, that have finished before ' . (new DateTime())->subSeconds(Config::cleanuptimeout()));
+		}
+		if (Config::cleanupAbortedTimeout()) {
+			$io->out('Deleting aborted jobs, last attempted before ' . (new DateTime())->subSeconds(Config::cleanupAbortedTimeout()));
+		}
 		$result = $this->QueuedJobs->cleanOldJobs();
 		$io->success('Deleted: ' . $result);
 
 		return static::CODE_SUCCESS;
+	}
+
+	/**
+	 * Resolve and validate the connection name.
+	 *
+	 * @param string|null $connection Requested connection
+	 *
+	 * @return string
+	 */
+	protected function resolveConnection(?string $connection): string {
+		$connections = Configure::read('Queue.connections');
+
+		// Single connection mode (backwards compatible)
+		if (!$connections || !is_array($connections) || count($connections) < 2) {
+			return $connection ?: 'default';
+		}
+
+		// Multi-connection mode
+		if ($connection === null) {
+			// Use first connection as default
+			return $connections[0];
+		}
+
+		// Validate against whitelist
+		if (!in_array($connection, $connections, true)) {
+			throw new RuntimeException(__d('queue', 'Invalid connection: {0}. Must be one of: {1}', $connection, implode(', ', $connections)));
+		}
+
+		return $connection;
 	}
 
 }

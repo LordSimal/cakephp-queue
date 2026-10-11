@@ -61,7 +61,7 @@ class BakeQueueTaskCommand extends SimpleBakeCommand {
 		$io->out('Generating: ' . $className . ' test class');
 
 		$plugin = (string)$args->getOption('plugin');
-		$namespace = $plugin ? str_replace('/', DS, $plugin) : Configure::read('App.namespace');
+		$namespace = $plugin ? str_replace('/', '\\', $plugin) : Configure::read('App.namespace');
 
 		$content = $this->generateTaskTestContent($className, $namespace);
 		$path = $plugin ? Plugin::path($plugin) : ROOT . DS;
@@ -86,12 +86,12 @@ class BakeQueueTaskCommand extends SimpleBakeCommand {
 		}
 		$taskClassNamespace = $namespace . '\Queue\\Task\\' . str_replace(DS, '\\', $name);
 
-		if (strpos($name, '/') !== false) {
+		if (str_contains($name, '/')) {
 			$parts = explode('/', $name);
 			$name = array_pop($parts);
 		}
 
-		$content = <<<TXT
+		return <<<TXT
 <?php
 
 namespace $namespace\Test\TestCase\Queue\Task$subNamespace;
@@ -122,8 +122,6 @@ class $testName extends TestCase {
 }
 
 TXT;
-
-		return $content;
 	}
 
 	/**
@@ -148,7 +146,7 @@ TXT;
 		$namespace .= '\\Queue\\Task';
 
 		$namespacePart = null;
-		if (strpos($name, '/') !== false) {
+		if (str_contains($name, '/')) {
 			$parts = explode('/', $name);
 			$name = array_pop($parts);
 			$namespacePart = implode('\\', $parts);

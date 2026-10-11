@@ -11,8 +11,8 @@ use Cake\ORM\Behavior;
 use Cake\ORM\Entity;
 use Cake\ORM\Query\SelectQuery;
 use InvalidArgumentException;
+use Queue\Database\Type\ArrayType;
 use RuntimeException;
-use Shim\Database\Type\ArrayType;
 
 /**
  * A behavior that will json_encode (and json_decode) fields if they contain an array or specific pattern.
@@ -172,13 +172,11 @@ class JsonableBehavior extends Behavior {
 	 * @return string|null
 	 */
 	public function _encode($val) {
-		if (!empty($this->_config['fields'])) {
-			if ($this->_config['input'] === 'json') {
-				if (!is_string($val)) {
-					throw new InvalidArgumentException('Only accepts JSON string for input type `json`');
-				}
-				$val = $this->_fromJson($val);
+		if (!empty($this->_config['fields']) && $this->_config['input'] === 'json') {
+			if (!is_string($val)) {
+				throw new InvalidArgumentException('Only accepts JSON string for input type `json`');
 			}
+			$val = $this->_fromJson($val);
 		}
 		if (!is_array($val)) {
 			return null;
@@ -216,10 +214,15 @@ class JsonableBehavior extends Behavior {
 	/**
 	 * @param string $val
 	 *
+	 * @throws \InvalidArgumentException
+	 *
 	 * @return array
 	 */
 	protected function _fromJson(string $val): array {
-		$json = json_decode($val, true, JSON_THROW_ON_ERROR);
+		$json = json_decode($val, true);
+		if (!is_array($json)) {
+			throw new InvalidArgumentException('Invalid JSON: ' . json_last_error_msg());
+		}
 
 		return $json;
 	}

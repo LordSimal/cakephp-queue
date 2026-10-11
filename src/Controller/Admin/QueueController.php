@@ -3,8 +3,8 @@ declare(strict_types=1);
 
 namespace Queue\Controller\Admin;
 
-use App\Controller\AppController;
 use Cake\Core\App;
+use Cake\Core\Configure;
 use Cake\Http\Exception\NotFoundException;
 use Queue\Queue\AddFromBackendInterface;
 use Queue\Queue\AddInterface;
@@ -14,9 +14,7 @@ use Queue\Queue\TaskFinder;
  * @property \Queue\Model\Table\QueuedJobsTable $QueuedJobs
  * @property \Queue\Model\Table\QueueProcessesTable $QueueProcesses
  */
-class QueueController extends AppController {
-
-	use LoadHelperTrait;
+class QueueController extends QueueAppController {
 
 	/**
 	 * @var string|null
@@ -29,7 +27,10 @@ class QueueController extends AppController {
 	public function initialize(): void {
 		parent::initialize();
 
-		$this->loadHelpers();
+		// Set connection for multi-connection support
+		if ($this->activeConnection !== $this->QueuedJobs->getConnection()->configName()) {
+			$this->QueuedJobs->setConnection($this->getActiveConnectionObject());
+		}
 	}
 
 	/**
@@ -40,19 +41,43 @@ class QueueController extends AppController {
 	 */
 	public function index() {
 		$QueueProcesses = $this->fetchTable('Queue.QueueProcesses');
+		if ($this->activeConnection !== $QueueProcesses->getConnection()->configName()) {
+			$QueueProcesses->setConnection($this->getActiveConnectionObject());
+		}
 		$status = $QueueProcesses->status();
 
 		$current = $this->QueuedJobs->getLength();
-		$pendingDetails = $this->QueuedJobs->getPendingStats()->toArray();
-		$new = 0;
-		foreach ($pendingDetails as $pendingDetail) {
-			if ($pendingDetail['fetched'] || $pendingDetail['attempts']) {
-				continue;
-			}
-			$new++;
+
+		// Cap how many pending/scheduled rows we materialise and pass to the
+		// view. Without a cap a backlog of thousands of pending jobs makes
+		// the dashboard explode: heavy per-row HTML in the response, and
+		// DebugKit's Variables panel serialising every entity for its
+		// snapshot can OOM the request. Aggregate tile counts on the
+		// dashboard keep using DB-side count() queries so they reflect the
+		// true totals regardless of the visible-list cap.
+		$detailsLimit = (int)Configure::read('Queue.adminDetailsLimit', 200);
+
+		// +1 row past the cap so we can detect truncation without a second
+		// count query in the small-backlog case.
+		$pendingDetails = $this->QueuedJobs->getPendingStats()->limit($detailsLimit + 1)->toArray();
+		$pendingDetailsTruncated = count($pendingDetails) > $detailsLimit;
+		if ($pendingDetailsTruncated) {
+			array_pop($pendingDetails);
 		}
 
-		$scheduledDetails = $this->QueuedJobs->getScheduledStats()->toArray();
+		$new = $this->QueuedJobs->getNewCount();
+
+		$scheduledDetails = $this->QueuedJobs->getScheduledStats()->limit($detailsLimit + 1)->toArray();
+		$scheduledDetailsTruncated = count($scheduledDetails) > $detailsLimit;
+		if ($scheduledDetailsTruncated) {
+			array_pop($scheduledDetails);
+		}
+
+		$abortedDetails = $this->QueuedJobs->getAbortedStats()->limit($detailsLimit + 1)->toArray();
+		$abortedDetailsTruncated = count($abortedDetails) > $detailsLimit;
+		if ($abortedDetailsTruncated) {
+			array_pop($abortedDetails);
+		}
 
 		$data = $this->QueuedJobs->getStats();
 
@@ -60,8 +85,87 @@ class QueueController extends AppController {
 		$tasks = $taskFinder->all();
 		$addableTasks = $taskFinder->allAddable(AddFromBackendInterface::class);
 
+		$taskDescriptions = [];
+		foreach ($tasks as $task => $className) {
+			/** @var \Queue\Queue\Task $taskObject */
+			$taskObject = new $className();
+			$taskDescriptions[$task] = $taskObject->description();
+		}
+
 		$servers = $QueueProcesses->serverList();
-		$this->set(compact('new', 'current', 'data', 'pendingDetails', 'scheduledDetails', 'status', 'tasks', 'addableTasks', 'servers'));
+		$workers = $status ? $status['workers'] : 0;
+
+		// True totals from DB. When the visible list is truncated we need
+		// these for the "showing N of M" hint; when it isn't, they also
+		// happen to match $pendingDetails count (small extra query that
+		// avoids one branch in the derivation below).
+		$totalPending = $pendingDetailsTruncated
+			? $this->QueuedJobs->getPendingCount()
+			: count($pendingDetails);
+		$scheduledJobs = $scheduledDetailsTruncated
+			? $this->QueuedJobs->getScheduledCount()
+			: count($scheduledDetails);
+		$abortedJobs = $abortedDetailsTruncated
+			? $this->QueuedJobs->getAbortedCount()
+			: count($abortedDetails);
+
+		$runningJobs = $this->QueuedJobs->find()
+			->where([
+				'completed IS' => null,
+				'fetched IS NOT' => null,
+				'failure_message IS' => null,
+			])
+			->count();
+		$failedJobs = $this->QueuedJobs->find()
+			->where([
+				'completed IS' => null,
+				'failure_message IS NOT' => null,
+			])
+			->count();
+		// Aborted jobs (retries exhausted) carry a failure_message but are
+		// terminal and already excluded from getPendingCount()/getPendingStats().
+		// Subtract only the still-retriable failures here so aborted rows are not
+		// removed twice (which would under-count, or zero out, real pending work).
+		$retriableFailedJobs = $this->QueuedJobs->find()
+			->where([
+				'completed IS' => null,
+				'failure_message IS NOT' => null,
+				'OR' => [
+					'status IS' => null,
+					'status !=' => $this->QueuedJobs::STATUS_ABORTED,
+				],
+			])
+			->count();
+		// Pending = total pending minus running and still-retriable failed (to avoid double counting)
+		$pendingJobs = max(0, $totalPending - $runningJobs - $retriableFailedJobs);
+
+		$configurations = (array)Configure::read('Queue');
+
+		$this->set(compact(
+			'new',
+			'current',
+			'data',
+			'pendingDetails',
+			'scheduledDetails',
+			'abortedDetails',
+			'pendingDetailsTruncated',
+			'scheduledDetailsTruncated',
+			'abortedDetailsTruncated',
+			'detailsLimit',
+			'totalPending',
+			'status',
+			'tasks',
+			'addableTasks',
+			'taskDescriptions',
+			'servers',
+			'workers',
+			'pendingJobs',
+			'scheduledJobs',
+			'runningJobs',
+			'failedJobs',
+			'abortedJobs',
+			'configurations',
+		));
 	}
 
 	/**
@@ -84,13 +188,27 @@ class QueueController extends AppController {
 		}
 
 		$object = new $className();
+		// Measure the QueuedJobs count before invoking the task so we can
+		// tell whether the task actually queued a job. AddInterface::add()
+		// returns void and may silently no-op when required config is
+		// missing (e.g. EmailTask without Config.adminEmail). Without this
+		// check the controller would falsely report success.
+		$before = $this->QueuedJobs->find()->count();
 		if ($object instanceof AddInterface) {
 			$object->add(null);
 		} else {
 			$this->QueuedJobs->createJob($job);
 		}
+		$after = $this->QueuedJobs->find()->count();
 
-		$this->Flash->success('Job ' . $job . ' added');
+		if ($after > $before) {
+			$this->Flash->success('Job ' . $job . ' added');
+		} else {
+			$this->Flash->error(
+				'Job ' . $job . ' could not be added — the task did not create a job. '
+				. 'Check configuration (e.g. Config.adminEmail for Queue.Email) and server logs.',
+			);
+		}
 
 		return $this->refererRedirect(['action' => 'index']);
 	}
@@ -108,9 +226,11 @@ class QueueController extends AppController {
 			throw new NotFoundException();
 		}
 
-		$this->QueuedJobs->reset($id);
-
-		$this->Flash->success('Job # ' . $id . ' re-added');
+		if ($this->QueuedJobs->reset($id)) {
+			$this->Flash->success('Job # ' . $id . ' re-added');
+		} else {
+			$this->Flash->error('Job # ' . $id . ' could not be reset, it is not failed (anymore).');
+		}
 
 		return $this->refererRedirect($this->referer(['action' => 'index'], true));
 	}
@@ -136,6 +256,9 @@ class QueueController extends AppController {
 	 */
 	public function processes() {
 		$QueueProcesses = $this->fetchTable('Queue.QueueProcesses');
+		if ($this->activeConnection !== $QueueProcesses->getConnection()->configName()) {
+			$QueueProcesses->setConnection($this->getActiveConnectionObject());
+		}
 
 		if ($this->request->is('post') && $this->request->getQuery('end')) {
 			$pid = (string)$this->request->getQuery('end');
@@ -145,6 +268,10 @@ class QueueController extends AppController {
 		}
 		if ($this->request->is('post') && $this->request->getQuery('kill')) {
 			$pid = (string)$this->request->getQuery('kill');
+			// Only signal PIDs of known workers; posix_kill() also accepts -1 and 0.
+			if ((int)$pid <= 1 || !$QueueProcesses->exists(['pid' => $pid])) {
+				throw new NotFoundException('No such worker process.');
+			}
 			$QueueProcesses->terminateProcess($pid);
 
 			return $this->redirect(['action' => 'processes']);
@@ -164,7 +291,11 @@ class QueueController extends AppController {
 	 */
 	public function reset() {
 		$this->request->allowMethod('post');
-		$resetted = $this->QueuedJobs->reset(null, (bool)$this->request->getQuery('full'));
+		if ($this->request->getQuery('aborted')) {
+			$resetted = $this->QueuedJobs->resetAborted();
+		} else {
+			$resetted = $this->QueuedJobs->reset(null, (bool)$this->request->getQuery('full'));
+		}
 
 		$message = __d('queue', '{0} jobs reset for re-run', $resetted);
 		$this->Flash->success($message);
@@ -212,7 +343,8 @@ class QueueController extends AppController {
 		if (is_array($url)) {
 			throw new NotFoundException('Invalid array in query string');
 		}
-		if ($url && (mb_substr($url, 0, 1) !== '/' || mb_substr($url, 0, 2) === '//')) {
+		// Browsers treat "/\\host" like "//host", so both are protocol-relative.
+		if ($url && (mb_substr((string)$url, 0, 1) !== '/' || in_array(mb_substr((string)$url, 1, 1), ['/', '\\'], true))) {
 			$url = null;
 		}
 

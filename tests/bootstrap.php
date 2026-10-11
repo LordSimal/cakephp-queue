@@ -19,7 +19,7 @@ if (!defined('DS')) {
 	define('DS', DIRECTORY_SEPARATOR);
 }
 if (!defined('WINDOWS')) {
-	if (DS === '\\' || substr(PHP_OS, 0, 3) === 'WIN') {
+	if (DS === '\\' || str_starts_with(PHP_OS, 'WIN')) {
 		define('WINDOWS', true);
 	} else {
 		define('WINDOWS', false);
@@ -138,3 +138,8 @@ if (env('FIXTURE_SCHEMA_METADATA')) {
 	$loader = new SchemaLoader();
 	$loader->loadInternalFile(env('FIXTURE_SCHEMA_METADATA'));
 }
+
+// Permissive default for test runs. Production installs MUST configure their
+// own Closure (default-deny). Individual tests may override or delete this to
+// exercise the deny path.
+Configure::write('Queue.adminAccess', fn () => true);

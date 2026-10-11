@@ -23,7 +23,7 @@ You may create a file called `app_queue.php` inside your `config` folder (NOT th
     // Legacy: 'defaultworkertimeout' is deprecated but still supported
     ```
 
-  **Important:** Individual task `timeout` property values should NOT exceed this `defaultRequeueTimeout` value. If a task has a timeout longer than the global requeue timeout, the job will be requeued before the task completes, causing duplicate execution. Always ensure `defaultRequeueTimeout` is greater than your longest task timeout (recommended: at least 2x the longest task timeout).
+  **Note:** Individual task `timeout` values are automatically capped to this `defaultRequeueTimeout` value to prevent duplicate execution. If a task needs a longer timeout, increase `defaultRequeueTimeout` accordingly (recommended: at least 2x your longest task timeout).
 
 - Default number of retries if a job fails or times out:
 
@@ -49,6 +49,14 @@ You may create a file called `app_queue.php` inside your `config` folder (NOT th
   bin/cake queue run --max-runtime 300   # Run for 5 minutes
   ```
 
+- Optional per-worker jitter (in seconds) added to the worker lifetime:
+
+    ```php
+    $config['Queue']['workerLifetimeJitter'] = 30; // up to +30s random offset per worker
+    ```
+
+  Each worker picks a random offset in `[0, workerLifetimeJitter]` at startup and adds it to its effective lifetime. Useful when many workers are spawned simultaneously (e.g. ECS/Kubernetes) to stagger shutdowns and avoid a thundering herd of concurrent restarts. Defaults to `0` (no jitter). If `workerLifetime` or the `--max-runtime` override is `0` (unlimited), this setting has no effect.
+
 - Seconds of running time after which the PHP process of the worker will terminate:
 
     ```php
@@ -72,16 +80,22 @@ You may create a file called `app_queue.php` inside your `config` folder (NOT th
     $config['Queue']['cleanuptimeout'] = 2592000; // 30 days
     ```
 
+- Seconds after their last attempt before a cleanup run removes aborted jobs (retries exhausted). Defaults to 0, which keeps them until they are reset or flushed:
+
+    ```php
+    $config['Queue']['cleanupAbortedTimeout'] = 604800; // 7 days
+    ```
+
 - Max workers (per server):
 
     ```php
-    $config['Queue']['maxworkers'] = 3 // Defaults to 1 (single worker can be run per server)
+    $config['Queue']['maxworkers'] = 3; // Defaults to 1 (single worker can be run per server)
     ```
 
 - Multi-server setup:
 
     ```php
-    $config['Queue']['multiserver'] = true // Defaults to false (single server)
+    $config['Queue']['multiserver'] = true; // Defaults to false (single server)
     ```
 
   For multiple servers running either CLI/web separately, or even multiple CLI workers on top, make sure to enable this.
@@ -159,6 +173,30 @@ You can set two main things on each task as property: timeout and retries.
     public ?int $retries = 1;
 ```
 Make sure you set the timeout high enough so that it could never run longer than this, otherwise you risk it being re-run while still being run.
-It is recommended setting it to at least 2x the maximum possible execution length. See [Concurrent workers](limitations.md)
+It is recommended setting it to at least 2x the maximum possible execution length. See [Concurrent workers](/reference/limitations)
 
 Set the retries to at least 1, otherwise it will never execute again after failure in the first run.
+
+### Configure-based task overrides
+
+You can also override task properties via Configure, which is useful for:
+- Third-party tasks you cannot modify
+- Environment-specific settings (dev vs production)
+- Centralized configuration management
+
+```php
+$config['Queue']['tasks'] = [
+    'Queue.ProgressExample' => [
+        'timeout' => 300,   // Override the task's timeout
+        'retries' => 5,     // Override the task's retries
+    ],
+    'MyPlugin.HeavyTask' => [
+        'timeout' => 600,
+        'rate' => 10,
+        'costs' => 50,
+        'unique' => true,
+    ],
+];
+```
+
+The priority order is: Configure override > Task class property > Global default.

@@ -27,7 +27,7 @@ class Config {
 				);
 			}
 		}
-		$timeout = $timeout ?? 600; // 10min default
+		$timeout ??= 600; // 10min default
 
 		if ($timeout <= 0) {
 			throw new InvalidArgumentException('Queue.defaultRequeueTimeout (or deprecated defaultworkertimeout) is less or equal than zero. Indefinite running of jobs is not supported.');
@@ -68,10 +68,35 @@ class Config {
 	}
 
 	/**
+	 * Seconds after their last attempt before a cleanup run removes aborted jobs (0 keeps them)
+	 *
+	 * @return int
+	 */
+	public static function cleanupAbortedTimeout(): int {
+		return (int)Configure::read('Queue.cleanupAbortedTimeout', 0);
+	}
+
+	/**
 	 * @return int
 	 */
 	public static function sleeptime(): int {
 		return Configure::read('Queue.sleeptime', 10);
+	}
+
+	/**
+	 * Threshold in seconds after which a queue_processes row whose `modified`
+	 * timestamp is older is considered stale by a starting worker. Workers
+	 * heartbeat (refresh `modified`) on every loop iteration, so a row not
+	 * refreshed in ~90s almost certainly belongs to a dead worker — typically
+	 * a container that was force-restarted. This is intentionally much shorter
+	 * than `defaultRequeueTimeout` (which governs in-flight job requeueing).
+	 *
+	 * @return int
+	 */
+	public static function staleHeartbeatThreshold(): int {
+		$threshold = Configure::read('Queue.staleHeartbeatThreshold');
+
+		return $threshold ?? 90;
 	}
 
 	/**
@@ -129,6 +154,7 @@ class Config {
 	public static function taskConfig(array $tasks): array {
 		$config = [];
 		$defaultTimeout = static::defaultworkertimeout();
+		$taskOverrides = Configure::read('Queue.tasks', []);
 
 		foreach ($tasks as $task => $className) {
 			[$pluginName, $taskName] = pluginSplit($task);
@@ -136,33 +162,24 @@ class Config {
 			/** @var \Queue\Queue\Task $taskObject */
 			$taskObject = new $className();
 
-			$taskTimeout = $taskObject->timeout ?? $defaultTimeout;
+			// Get task-specific config overrides from Configure
+			$taskConfig = $taskOverrides[$task] ?? [];
 
-			// Warn if task timeout is greater than the requeue timeout, which can cause premature requeuing
+			$taskTimeout = $taskConfig['timeout'] ?? $taskObject->timeout ?? $defaultTimeout;
+
+			// Auto-cap task timeout to defaultRequeueTimeout to prevent duplicate execution
 			if ($taskTimeout > $defaultTimeout) {
-				trigger_error(
-					sprintf(
-						'Task "%s" has timeout (%d seconds) larger than defaultRequeueTimeout (%d seconds). '
-						. 'The job will be requeued after %d seconds even though the task expects to run for %d seconds. '
-						. 'This can cause duplicate execution. Consider increasing defaultRequeueTimeout or decreasing the task timeout.',
-						$task,
-						$taskTimeout,
-						$defaultTimeout,
-						$defaultTimeout,
-						$taskTimeout,
-					),
-					E_USER_WARNING,
-				);
+				$taskTimeout = $defaultTimeout;
 			}
 
 			$config[$task]['class'] = $className;
 			$config[$task]['name'] = $taskName;
 			$config[$task]['plugin'] = $pluginName;
 			$config[$task]['timeout'] = $taskTimeout;
-			$config[$task]['retries'] = $taskObject->retries ?? static::defaultworkerretries();
-			$config[$task]['rate'] = $taskObject->rate;
-			$config[$task]['costs'] = $taskObject->costs;
-			$config[$task]['unique'] = $taskObject->unique;
+			$config[$task]['retries'] = $taskConfig['retries'] ?? $taskObject->retries ?? static::defaultworkerretries();
+			$config[$task]['rate'] = $taskConfig['rate'] ?? $taskObject->rate;
+			$config[$task]['costs'] = $taskConfig['costs'] ?? $taskObject->costs;
+			$config[$task]['unique'] = $taskConfig['unique'] ?? $taskObject->unique;
 
 			unset($taskObject);
 		}
